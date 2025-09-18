@@ -1,13 +1,11 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"math/rand"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -19,331 +17,297 @@ import (
    go get github.com/gorilla/websocket
    go run main.go
 
- Abre http://localhost:8080
+ Abrir en el navegador:
+   http://localhost:8080
 */
 
-var upgrader = websocket.Upgrader{
+// -------------------- Configuración WebSocket --------------------
+
+// Actualizador de WebSocket con CheckOrigin siempre true (permite cualquier origen)
+var actualizador = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// Mensaje que viaja por websocket
-type WSMessage struct {
-	Type  string `json:"type"`            // "log", "done", "summary"
-	Topic string `json:"topic,omitempty"` // "mpi" o "openmp"
-	Text  string `json:"text,omitempty"`
-	Obj   any    `json:"obj,omitempty"` // datos arbitrarios
+// -------------------- Tipo de mensaje para WebSocket --------------------
+
+// MensajeWS representa un mensaje que se envía por WebSocket
+type MensajeWS struct {
+	Tipo   string `json:"tipo"`             // "registro", "resumen", "finalizado"
+	Topico string `json:"topico,omitempty"` // "mpi" o "openmp"
+	Texto  string `json:"texto,omitempty"`  // texto del mensaje
+	Obj    any    `json:"obj,omitempty"`    // datos arbitrarios
 }
 
 // -------------------- MPI (anillo de sectores) --------------------
-// Simula que un auto pasa por todos los sectores en anillo.
-// En cada paso se envía por websocket: "Tiempo de sector X: Y seg"
-func runMPI(sectors int, laps int, send func(WSMessage)) {
-	if sectors < 1 {
-		send(WSMessage{Type: "log", Topic: "mpi", Text: "Error: sectores debe ser >= 1"})
-		send(WSMessage{Type: "done", Topic: "mpi"})
+
+// correrMPI simula un auto pasando por sectores en un anillo
+// En cada sector envía un mensaje por WebSocket con el tiempo de ese sector
+func correrMPI(sectores int, vueltas int, enviar chan MensajeWS) {
+	if sectores < 1 {
+		enviar <- MensajeWS{Tipo: "registro", Topico: "mpi", Texto: "Error: sectores debe ser >= 1"}
+		enviar <- MensajeWS{Tipo: "finalizado", Topico: "mpi"}
 		return
 	}
-	if laps < 1 {
-		laps = 1
+	if vueltas < 1 {
+		vueltas = 1
 	}
 
-	send(WSMessage{Type: "log", Topic: "mpi", Text: fmt.Sprintf("Iniciando MPI: %d sectores, %d vueltas", sectors, laps)})
+	enviar <- MensajeWS{Tipo: "registro", Topico: "mpi", Texto: fmt.Sprintf("Iniciando MPI: %d sectores, %d vueltas", sectores, vueltas)}
 
-	// Simulamos 1 auto que recorre todos los sectores por vuelta.
-	// Sector times típicos: 12s - 35s (ajustable)
-	for lap := 1; lap <= laps; lap++ {
-		send(WSMessage{Type: "log", Topic: "mpi", Text: fmt.Sprintf("=== Vuelta %d ===", lap)})
-		for s := 1; s <= sectors; s++ {
-			// generar tiempo en segundos con decimales
-			secTime := float64(rand.Intn(2300)+1200) / 100.0 // 12.00s .. 35.99s
-			// simulamos retraso real para "en tiempo real" (opcional)
-			time.Sleep(300 * time.Millisecond) // pequeño delay para ver flujo en la UI
-			send(WSMessage{
-				Type:  "log",
-				Topic: "mpi",
-				Text:  fmt.Sprintf("Tiempo de sector %d: %.2f s (vuelta %d)", s, secTime, lap),
-			})
+	// Simula cada vuelta
+	for v := 1; v <= vueltas; v++ {
+		enviar <- MensajeWS{Tipo: "registro", Topico: "mpi", Texto: fmt.Sprintf("=== Vuelta %d ===", v)}
+		for s := 1; s <= sectores; s++ {
+			// Genera tiempo de sector entre 12.00s y 35.99s
+			tiempoSector := float64(rand.Intn(2300)+1200) / 100.0
+			time.Sleep(300 * time.Millisecond) // Pequeño delay para simular tiempo real
+			enviar <- MensajeWS{
+				Tipo:   "registro",
+				Topico: "mpi",
+				Texto:  fmt.Sprintf("Tiempo de sector %d: %.2f s (vuelta %d)", s, tiempoSector, v),
+			}
 		}
 	}
-	// Summary simple: mejor sector total
-	send(WSMessage{Type: "summary", Topic: "mpi", Obj: map[string]any{"msg": "MPI finalizado"}})
-	send(WSMessage{Type: "done", Topic: "mpi"})
+	// Enviar resumen y mensaje de finalización
+	enviar <- MensajeWS{Tipo: "resumen", Topico: "mpi", Obj: map[string]any{"mensaje": "MPI finalizado"}}
+	enviar <- MensajeWS{Tipo: "finalizado", Topico: "mpi"}
 }
 
 // -------------------- OpenMP (vueltas rápidas entre varios autos) --------------------
-type OpenMPResult struct {
-	CarID    int     `json:"car_id"`
-	BestLap  float64 `json:"best_lap"`
-	LapCount int     `json:"lap_count"`
+
+// ResultadoOpenMP guarda la mejor vuelta de un auto
+type ResultadoOpenMP struct {
+	AutoID          int     `json:"auto_id"`          // ID del auto
+	MejorVuelta     float64 `json:"mejor_vuelta"`     // mejor tiempo de vuelta
+	CantidadVueltas int     `json:"cantidad_vueltas"` // cantidad de vueltas realizadas
 }
 
-// Simula varios autos (nCars) haciendo nLaps vueltas.
-// Los tiempos de vuelta estarán entre 75s y 95s típicamente (ajustable).
-func runOpenMP(nCars int, nLaps int, send func(WSMessage)) {
-	if nCars < 1 {
-		send(WSMessage{Type: "log", Topic: "openmp", Text: "Error: cantidad de autos debe ser >= 1"})
-		send(WSMessage{Type: "done", Topic: "openmp"})
+// correrOpenMP simula varios autos corriendo vueltas rápidas en paralelo
+func correrOpenMP(cantidadAutos int, vueltas int, enviar chan MensajeWS) {
+	if cantidadAutos < 1 {
+		enviar <- MensajeWS{Tipo: "registro", Topico: "openmp", Texto: "Error: cantidad de autos debe ser >= 1"}
+		enviar <- MensajeWS{Tipo: "finalizado", Topico: "openmp"}
 		return
 	}
-	if nLaps < 1 {
-		nLaps = 1
+	if vueltas < 1 {
+		vueltas = 1
 	}
-	send(WSMessage{Type: "log", Topic: "openmp", Text: fmt.Sprintf("Iniciando OpenMP: %d autos, %d vueltas cada uno", nCars, nLaps)})
 
-	var wg sync.WaitGroup
-	results := make([]OpenMPResult, nCars)
-	mutex := sync.Mutex{}
+	enviar <- MensajeWS{Tipo: "registro", Topico: "openmp", Texto: fmt.Sprintf("Iniciando OpenMP: %d autos, %d vueltas cada uno", cantidadAutos, vueltas)}
 
-	// cada auto corre como goroutine "paralela"
-	for car := 0; car < nCars; car++ {
-		wg.Add(1)
-		go func(carID int) {
-			defer wg.Done()
-			best := 1e9
-			for lap := 1; lap <= nLaps; lap++ {
-				// tiempo de vuelta random 75.00 - 95.99 s
-				lapTime := float64(rand.Intn(2099)+7500) / 100.0
-				// enviamos evento en tiempo real
-				time.Sleep(200 * time.Millisecond) // pequeño delay para ver el streaming
-				send(WSMessage{
-					Type:  "log",
-					Topic: "openmp",
-					Text:  fmt.Sprintf("Auto %d - Vuelta %d: %.2f s", carID+1, lap, lapTime),
-				})
-				if lapTime < best {
-					best = lapTime
-					send(WSMessage{
-						Type:  "log",
-						Topic: "openmp",
-						Text:  fmt.Sprintf("Auto %d - Nueva mejor vuelta: %.2f s", carID+1, best),
-					})
+	resultados := make([]ResultadoOpenMP, cantidadAutos) // resultados por auto
+	done := make(chan struct{})                          // canal para esperar goroutines
+
+	// Inicia cada auto como goroutine
+	for auto := 0; auto < cantidadAutos; auto++ {
+		go func(autoID int) {
+			defer func() { done <- struct{}{} }() // señal de finalización
+
+			mejor := 1e9
+			for v := 1; v <= vueltas; v++ {
+				// Genera tiempo de vuelta entre 75.00s y 95.99s
+				tiempoVuelta := float64(rand.Intn(2099)+7500) / 100.0
+				time.Sleep(200 * time.Millisecond)
+				enviar <- MensajeWS{Tipo: "registro", Topico: "openmp", Texto: fmt.Sprintf("Auto %d - Vuelta %d: %.2f s", autoID+1, v, tiempoVuelta)}
+				if tiempoVuelta < mejor {
+					mejor = tiempoVuelta
+					enviar <- MensajeWS{Tipo: "registro", Topico: "openmp", Texto: fmt.Sprintf("Auto %d - Nueva mejor vuelta: %.2f s", autoID+1, mejor)}
 				}
 			}
-			mutex.Lock()
-			results[carID] = OpenMPResult{CarID: carID + 1, BestLap: best, LapCount: nLaps}
-			mutex.Unlock()
-		}(car)
+			resultados[autoID] = ResultadoOpenMP{AutoID: autoID + 1, MejorVuelta: mejor, CantidadVueltas: vueltas}
+		}(auto)
 	}
 
-	wg.Wait()
-	// calcular mejor general
-	bestOverall := OpenMPResult{CarID: -1, BestLap: 1e9}
-	for _, r := range results {
-		if r.BestLap < bestOverall.BestLap {
-			bestOverall = r
+	// Espera a que terminen todos los autos
+	for i := 0; i < cantidadAutos; i++ {
+		<-done
+	}
+
+	// Calcula mejor vuelta general
+	mejorGeneral := ResultadoOpenMP{AutoID: -1, MejorVuelta: 1e9}
+	for _, r := range resultados {
+		if r.MejorVuelta < mejorGeneral.MejorVuelta {
+			mejorGeneral = r
 		}
 	}
-	send(WSMessage{Type: "summary", Topic: "openmp", Obj: map[string]any{
-		"best_per_car": results,
-		"best_overall": bestOverall,
-	}})
-	send(WSMessage{Type: "done", Topic: "openmp"})
+
+	enviar <- MensajeWS{Tipo: "resumen", Topico: "openmp", Obj: map[string]any{
+		"mejor_por_auto": resultados,
+		"mejor_general":  mejorGeneral,
+	}}
+	enviar <- MensajeWS{Tipo: "finalizado", Topico: "openmp"}
 }
 
-// -------------------- Websocket handler --------------------
+// -------------------- WebSocket handler --------------------
 
+// wsHandler gestiona la conexión WebSocket
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := actualizador.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("upgrade:", err)
+		log.Println("Error al actualizar a websocket:", err)
 		return
 	}
 	defer conn.Close()
-	// canal para señales de cierre locales
-	done := make(chan struct{})
-	defer close(done)
 
-	// función para enviar mensajes JSON seguros
-	send := func(msg WSMessage) {
-		// log local
-		j, _ := json.Marshal(msg)
-		log.Println("->", string(j))
-		conn.WriteJSON(msg)
-	}
+	enviar := make(chan MensajeWS, 100) // canal de mensajes
+	defer close(enviar)
 
-	// Escuchar mensajes entrantes (start commands)
+	// Goroutine que envía mensajes de forma segura
 	go func() {
-		for {
-			var m map[string]any
-			if err := conn.ReadJSON(&m); err != nil {
-				log.Println("read json err:", err)
-				// cerrar y terminar
-				_ = conn.Close()
+		for msg := range enviar {
+			if err := conn.WriteJSON(msg); err != nil {
+				log.Println("Error escribiendo en websocket:", err)
 				return
-			}
-			// manejar comandos simples
-			cmd, _ := m["action"].(string)
-			switch cmd {
-			case "start_mpi":
-				sectorsF := m["sectors"]
-				lapsF := m["laps"]
-				sectors := int(1)
-				laps := int(1)
-				if v, ok := sectorsF.(float64); ok {
-					sectors = int(v)
-				}
-				if v, ok := lapsF.(float64); ok {
-					laps = int(v)
-				}
-				// runMPI en goroutine para no bloquear lectura
-				go runMPI(sectors, laps, send)
-			case "start_openmp":
-				carsF := m["cars"]
-				lapsF := m["laps"]
-				cars := 3
-				laps := 5
-				if v, ok := carsF.(float64); ok {
-					cars = int(v)
-				}
-				if v, ok := lapsF.(float64); ok {
-					laps = int(v)
-				}
-				go runOpenMP(cars, laps, send)
-			default:
-				send(WSMessage{Type: "log", Text: fmt.Sprintf("Comando no reconocido: %v", cmd)})
 			}
 		}
 	}()
 
-	// Mantener conexión abierta hasta que cliente la cierre
-	<-done
+	// Bucle principal de lectura de comandos
+	for {
+		var comando map[string]any
+		if err := conn.ReadJSON(&comando); err != nil {
+			log.Println("Conexión cerrada o error de lectura:", err)
+			return
+		}
+		switch comando["action"] {
+		case "iniciar_mpi":
+			sectores := 1
+			vueltas := 1
+			if v, ok := comando["sectores"].(float64); ok {
+				sectores = int(v)
+			}
+			if v, ok := comando["vueltas"].(float64); ok {
+				vueltas = int(v)
+			}
+			go correrMPI(sectores, vueltas, enviar)
+		case "iniciar_openmp":
+			autos := 3
+			vueltas := 5
+			if v, ok := comando["autos"].(float64); ok {
+				autos = int(v)
+			}
+			if v, ok := comando["vueltas"].(float64); ok {
+				vueltas = int(v)
+			}
+			go correrOpenMP(autos, vueltas, enviar)
+		default:
+			enviar <- MensajeWS{Tipo: "registro", Texto: fmt.Sprintf("Comando no reconocido: %v", comando["action"])}
+		}
+	}
 }
 
-// -------------------- HTTP (sirve HTML/JS) --------------------
+// -------------------- HTTP handler --------------------
 
-var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
+var plantillaIndex = template.Must(template.New("index").Parse(htmlIndex))
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	indexTmpl.Execute(w, nil)
+	plantillaIndex.Execute(w, nil)
 }
 
+// -------------------- Main --------------------
 func main() {
 	rand.Seed(time.Now().UnixNano())
-
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/ws", wsHandler)
 
 	addr := ":8080"
-	fmt.Println("Servidor en http://localhost" + addr)
+	fmt.Println("Servidor corriendo en http://localhost" + addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
 // -------------------- HTML + JS embebido --------------------
-
-const indexHTML = `
+const htmlIndex = `
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"/>
-  <title>Simulaciones MPI / OpenMP - Formula1</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 16px; }
-    .col { display:inline-block; vertical-align:top; margin-right:20px; width:45%; }
-    textarea{ width:100%; height:300px; }
-    input[type="number"]{ width:80px; }
-    button{ padding:8px 12px; margin-top:6px; }
-    .log-mpi{ background:#f0f8ff; padding:8px; border-radius:6px; height:320px; overflow:auto;}
-    .log-openmp{ background:#fff8f0; padding:8px; border-radius:6px; height:320px; overflow:auto;}
-  </style>
+<meta charset="utf-8"/>
+<title>Simulaciones MPI / OpenMP - Fórmula1</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 16px; }
+.col { display:inline-block; vertical-align:top; margin-right:20px; width:45%; }
+textarea{ width:100%; height:300px; }
+input[type="number"]{ width:80px; }
+button{ padding:8px 12px; margin-top:6px; }
+.log-mpi{ background:#f0f8ff; padding:8px; border-radius:6px; height:320px; overflow:auto;}
+.log-openmp{ background:#fff8f0; padding:8px; border-radius:6px; height:320px; overflow:auto;}
+</style>
 </head>
 <body>
-  <h2>Simulaciones Formula1 — MPI (sectores) y OpenMP (vueltas rápidas)</h2>
-  <div style="display:flex; gap: 16px;">
-    <div class="col">
-      <h3>MPI - Sectores (anillo)</h3>
-      <label>Sector count: <input id="mpi-sectors" type="number" value="5" min="1"></label><br>
-      <label>Vueltas: <input id="mpi-laps" type="number" value="3" min="1"></label><br>
-      <button id="start-mpi">Iniciar MPI</button>
-      <div style="margin-top:10px;">
-        <h4>Salida MPI</h4>
-        <div id="mpi-log" class="log-mpi"></div>
-      </div>
-    </div>
-
-    <div class="col">
-      <h3>OpenMP - Vueltas rápidas</h3>
-      <label>Autos: <input id="openmp-cars" type="number" value="4" min="1"></label><br>
-      <label>Vueltas por auto: <input id="openmp-laps" type="number" value="5" min="1"></label><br>
-      <button id="start-openmp">Iniciar OpenMP</button>
-      <div style="margin-top:10px;">
-        <h4>Salida OpenMP</h4>
-        <div id="openmp-log" class="log-openmp"></div>
-      </div>
+<h2>Simulaciones Fórmula1 — MPI (sectores) y OpenMP (vueltas rápidas)</h2>
+<div style="display:flex; gap: 16px;">
+  <div class="col">
+    <h3>MPI - Sectores (anillo)</h3>
+    <label>Cantidad de sectores: <input id="mpi-sectores" type="number" value="5" min="1"></label><br>
+    <label>Vueltas: <input id="mpi-vueltas" type="number" value="3" min="1"></label><br>
+    <button id="start-mpi">Iniciar MPI</button>
+    <div style="margin-top:10px;">
+      <h4>Salida MPI</h4>
+      <div id="mpi-log" class="log-mpi"></div>
     </div>
   </div>
 
-  <script>
-    const ws = new WebSocket("ws://" + location.host + "/ws");
-    const mpiLog = document.getElementById("mpi-log");
-    const openmpLog = document.getElementById("openmp-log");
+  <div class="col">
+    <h3>OpenMP - Vueltas rápidas</h3>
+    <label>Autos: <input id="openmp-autos" type="number" value="4" min="1"></label><br>
+    <label>Vueltas por auto: <input id="openmp-vueltas" type="number" value="5" min="1"></label><br>
+    <button id="start-openmp">Iniciar OpenMP</button>
+    <div style="margin-top:10px;">
+      <h4>Salida OpenMP</h4>
+      <div id="openmp-log" class="log-openmp"></div>
+    </div>
+  </div>
+</div>
 
-    ws.onopen = () => {
-      appendBoth("Conexión WebSocket establecida.");
-    };
-    ws.onclose = () => appendBoth("WebSocket cerrado.");
-    ws.onerror = (e) => appendBoth("WebSocket error: " + e);
+<script>
+const ws = new WebSocket("ws://" + location.host + "/ws");
+const mpiLog = document.getElementById("mpi-log");
+const openmpLog = document.getElementById("openmp-log");
 
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data);
-        // msg: {type, topic, text, obj}
-        if (msg.topic === "mpi") {
-          append(mpiLog, formatMessage(msg));
-        } else if (msg.topic === "openmp") {
-          append(openmpLog, formatMessage(msg));
-        } else {
-          // general
-          appendBoth(formatMessage(msg));
-        }
+ws.onopen = () => appendAmbos("Conexión WebSocket establecida.");
+ws.onclose = () => appendAmbos("WebSocket cerrado.");
+ws.onerror = (e) => appendAmbos("Error WebSocket: " + e);
 
-        if (msg.type === "summary") {
-          if (msg.topic === "openmp") {
-            append(openmpLog, "<b>Resumen OpenMP:</b> " + JSON.stringify(msg.obj));
-          } else if (msg.topic === "mpi") {
-            append(mpiLog, "<b>Resumen MPI:</b> " + JSON.stringify(msg.obj));
-          }
-        }
-      } catch (err) {
-        appendBoth("Mensaje no JSON: " + evt.data);
-      }
-    };
+ws.onmessage = (evt) => {
+  try {
+    const msg = JSON.parse(evt.data);
+    if(msg.topico==="mpi") append(mpiLog, formatear(msg));
+    else if(msg.topico==="openmp") append(openmpLog, formatear(msg));
+    else appendAmbos(formatear(msg));
 
-    function formatMessage(msg) {
-      if (msg.type === "log") return sanitize(msg.text);
-      if (msg.type === "done") return "<i>Proceso finalizado (" + (msg.topic||"") + ")</i>";
-      if (msg.type === "summary") return "<i>Resumen: " + JSON.stringify(msg.obj) + "</i>";
-      return JSON.stringify(msg);
+    if(msg.tipo==="resumen"){
+      if(msg.topico==="mpi") append(mpiLog,"<b>Resumen MPI:</b> "+JSON.stringify(msg.obj));
+      if(msg.topico==="openmp") append(openmpLog,"<b>Resumen OpenMP:</b> "+JSON.stringify(msg.obj));
     }
+  } catch(e){
+    appendAmbos("Mensaje no JSON: "+evt.data);
+  }
+};
 
-    function append(target, text) {
-      const p = document.createElement("div");
-      p.innerHTML = text;
-      target.appendChild(p);
-      target.scrollTop = target.scrollHeight;
-    }
-    function appendBoth(text) {
-      append(mpiLog, text);
-      append(openmpLog, text);
-    }
-    function sanitize(s) {
-      if (!s) return "";
-      return s.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    }
+function formatear(msg){
+  if(msg.tipo==="registro") return sanitizar(msg.texto);
+  if(msg.tipo==="finalizado") return "<i>Proceso finalizado ("+(msg.topico||"")+")</i>";
+  if(msg.tipo==="resumen") return "<i>Resumen: "+JSON.stringify(msg.obj)+"</i>";
+  return JSON.stringify(msg);
+}
 
-    document.getElementById("start-mpi").onclick = () => {
-      const sectors = parseInt(document.getElementById("mpi-sectors").value) || 5;
-      const laps = parseInt(document.getElementById("mpi-laps").value) || 3;
-      ws.send(JSON.stringify({ action: "start_mpi", sectors: sectors, laps: laps }));
-      append(mpiLog, "<b>Comando enviado: iniciar MPI</b>");
-    };
+function append(target,text){ const p=document.createElement("div"); p.innerHTML=text; target.appendChild(p); target.scrollTop=target.scrollHeight;}
+function appendAmbos(text){ append(mpiLog,text); append(openmpLog,text);}
+function sanitizar(s){ if(!s) return ""; return s.replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 
-    document.getElementById("start-openmp").onclick = () => {
-      const cars = parseInt(document.getElementById("openmp-cars").value) || 4;
-      const laps = parseInt(document.getElementById("openmp-laps").value) || 5;
-      ws.send(JSON.stringify({ action: "start_openmp", cars: cars, laps: laps }));
-      append(openmpLog, "<b>Comando enviado: iniciar OpenMP</b>");
-    };
-  </script>
+document.getElementById("start-mpi").onclick = ()=>{
+  const sectores=parseInt(document.getElementById("mpi-sectores").value)||5;
+  const vueltas=parseInt(document.getElementById("mpi-vueltas").value)||3;
+  ws.send(JSON.stringify({action:"iniciar_mpi",sectores:sectores,vueltas:vueltas}));
+  append(mpiLog,"<b>Comando enviado: iniciar MPI</b>");
+};
+
+document.getElementById("start-openmp").onclick = ()=>{
+  const autos=parseInt(document.getElementById("openmp-autos").value)||4;
+  const vueltas=parseInt(document.getElementById("openmp-vueltas").value)||5;
+  ws.send(JSON.stringify({action:"iniciar_openmp",autos:autos,vueltas:vueltas}));
+  append(openmpLog,"<b>Comando enviado: iniciar OpenMP</b>");
+};
+</script>
 </body>
 </html>
 `
